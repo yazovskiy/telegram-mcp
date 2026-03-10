@@ -107,6 +107,7 @@ This MCP server exposes a huge suite of Telegram tools. **Every major Telegram/T
 
 ### Media
 - **get_media_info(chat_id, message_id)**: Get info about media in a message
+- **get_message_image(chat_id, message_id, prefer_thumbnail, max_bytes)**: Get base64 image data from a message (photos and image documents; stickers excluded)
 
 ### Search & Discovery
 - **search_public_chats(query)**: Search public chats/channels/bots
@@ -258,6 +259,35 @@ Edit your Claude desktop config (e.g. `~/Library/Application Support/Claude/clau
     }
   }
 }
+```
+
+### HTTP (Streamable) Transport
+If you want a long-running server that multiple clients can connect to, use Streamable HTTP transport.
+
+**Set env vars:**
+```
+MCP_TRANSPORT=streamable_http
+MCP_HOST=0.0.0.0
+MCP_PORT=8000
+MCP_STREAMABLE_HTTP_PATH=/mcp
+```
+
+**Docker Compose:**
+1. Add the env vars above to `.env`.
+2. Expose the port in `docker-compose.yml`:
+   ```
+   ports:
+     - "8000:8000"
+   ```
+3. Run:
+   ```
+   docker compose up --build
+   ```
+
+**Codex config (HTTP):**
+```
+[mcp_servers.telegram-mcp]
+url = "http://localhost:8000/mcp"
 ```
 
 ## 📝 Tool Examples with Code & Output

@@ -9,6 +9,9 @@ services:
     # Load environment variables from a .env file in the same directory
     env_file:
       - .env
+    # Enable for HTTP transport
+    ports:
+      - "8000:8000"
     # Keep stdin open and allocate a pseudo-TTY, crucial for stdio MCP servers
     stdin_open: true
     tty: true

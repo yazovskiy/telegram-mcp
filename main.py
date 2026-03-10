@@ -6,9 +6,11 @@ import asyncio
 import sqlite3
 import logging
 import mimetypes
+import base64
+import io
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import List, Dict, Optional, Union, Any
+from typing import List, Dict, Optional, Union, Any, Tuple
 
 # Third-party libraries
 import nest_asyncio
@@ -35,6 +37,9 @@ from telethon.tl.types import (
     DialogFilter,
     DialogFilterDefault,
     TextWithEntities,
+    DocumentAttributeSticker,
+    DocumentAttributeImageSize,
+    DocumentAttributeFilename,
 )
 import re
 from functools import wraps
@@ -66,7 +71,17 @@ TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME")
 # Check if a string session exists in environment, otherwise use file-based session
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
 
-mcp = FastMCP("telegram")
+MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio").lower()
+MCP_HOST = os.getenv("MCP_HOST", "127.0.0.1")
+MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
+MCP_STREAMABLE_HTTP_PATH = os.getenv("MCP_STREAMABLE_HTTP_PATH", "/mcp")
+
+mcp = FastMCP(
+    "telegram",
+    host=MCP_HOST,
+    port=MCP_PORT,
+    streamable_http_path=MCP_STREAMABLE_HTTP_PATH,
+)
 
 if SESSION_STRING:
     # Use the string session if available
@@ -303,6 +318,103 @@ def format_message(message) -> Dict[str, Any]:
     return result
 
 
+def is_sticker_message(message) -> bool:
+    """Return True if message media is a sticker."""
+    if getattr(message, "sticker", None):
+        return True
+    document = getattr(message, "document", None)
+    if not document:
+        return False
+    attrs = getattr(document, "attributes", None) or []
+    if any(isinstance(attr, DocumentAttributeSticker) for attr in attrs):
+        return True
+    mime_type = None
+    file_obj = getattr(message, "file", None)
+    if file_obj:
+        mime_type = getattr(file_obj, "mime_type", None)
+    if not mime_type:
+        mime_type = getattr(document, "mime_type", None)
+    return mime_type in {"application/x-tgsticker", "application/vnd.telegram.sticker"}
+
+
+def is_image_message(message) -> bool:
+    """Return True if message contains a non-sticker image (photo or image document)."""
+    if getattr(message, "photo", None):
+        return True
+    document = getattr(message, "document", None)
+    if not document or is_sticker_message(message):
+        return False
+    mime_type = None
+    file_obj = getattr(message, "file", None)
+    if file_obj:
+        mime_type = getattr(file_obj, "mime_type", None)
+    if not mime_type:
+        mime_type = getattr(document, "mime_type", None)
+    return bool(mime_type and mime_type.startswith("image/"))
+
+
+def _get_photo_dimensions(photo) -> Tuple[Optional[int], Optional[int]]:
+    sizes = getattr(photo, "sizes", None) or []
+    best = None
+    for size in sizes:
+        w = getattr(size, "w", None)
+        h = getattr(size, "h", None)
+        if w and h:
+            area = w * h
+            if not best or area > best[0]:
+                best = (area, w, h)
+    if not best:
+        return None, None
+    return best[1], best[2]
+
+
+def _get_document_dimensions(document) -> Tuple[Optional[int], Optional[int]]:
+    attrs = getattr(document, "attributes", None) or []
+    for attr in attrs:
+        if isinstance(attr, DocumentAttributeImageSize):
+            return getattr(attr, "w", None), getattr(attr, "h", None)
+    return None, None
+
+
+def _get_document_filename(document) -> Optional[str]:
+    attrs = getattr(document, "attributes", None) or []
+    for attr in attrs:
+        if isinstance(attr, DocumentAttributeFilename):
+            return getattr(attr, "file_name", None)
+    return None
+
+
+def get_image_meta(message) -> Dict[str, Any]:
+    """Extract common metadata from image messages."""
+    meta: Dict[str, Any] = {"id": message.id}
+    if getattr(message, "photo", None):
+        meta["kind"] = "photo"
+        width, height = _get_photo_dimensions(message.photo)
+    else:
+        meta["kind"] = "document"
+        document = getattr(message, "document", None)
+        width, height = _get_document_dimensions(document)
+        meta["filename"] = _get_document_filename(document)
+
+    meta["width"] = width
+    meta["height"] = height
+
+    file_obj = getattr(message, "file", None)
+    mime_type = None
+    size = None
+    if file_obj:
+        mime_type = getattr(file_obj, "mime_type", None)
+        size = getattr(file_obj, "size", None)
+    if not mime_type:
+        document = getattr(message, "document", None)
+        mime_type = getattr(document, "mime_type", None)
+        size = size or getattr(document, "size", None)
+
+    meta["mime_type"] = mime_type
+    meta["size"] = size
+    return meta
+
+
 def get_sender_name(message) -> str:
     """Helper function to get sender name from a message."""
     if not message.sender:
@@ -366,13 +478,19 @@ async def get_chats(page: int = 1, page_size: int = 20) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Messages", openWorldHint=True, readOnlyHint=True))
 @validate_id("chat_id")
-async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int = 20) -> str:
+async def get_messages(
+    chat_id: Union[int, str],
+    page: int = 1,
+    page_size: int = 20,
+    include_media: bool = False,
+) -> str:
     """
     Get paginated messages from a specific chat.
     Args:
         chat_id: The ID or username of the chat.
         page: Page number (1-indexed).
         page_size: Number of messages per page.
+        include_media: Include media summary in output.
     """
     try:
         entity = await client.get_entity(chat_id)
@@ -389,8 +507,25 @@ async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int =
 
             engagement_info = get_engagement_info(msg)
 
+            media_info = ""
+            if include_media and msg.media:
+                if is_image_message(msg):
+                    meta = get_image_meta(msg)
+                    dims = (
+                        f"{meta.get('width')}x{meta.get('height')}"
+                        if meta.get("width") and meta.get("height")
+                        else "unknown"
+                    )
+                    size = meta.get("size") or "unknown"
+                    mime = meta.get("mime_type") or "unknown"
+                    media_info = f" | Media: image {mime} {dims} size={size}"
+                elif is_sticker_message(msg):
+                    media_info = " | Media: sticker (excluded)"
+                else:
+                    media_info = f" | Media: {type(msg.media).__name__}"
+
             lines.append(
-                f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info}{engagement_info} | Message: {msg.message}"
+                f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info}{engagement_info}{media_info} | Message: {msg.message}"
             )
         return "\n".join(lines)
     except Exception as e:
@@ -714,6 +849,7 @@ async def list_messages(
     search_query: str = None,
     from_date: str = None,
     to_date: str = None,
+    include_media: bool = False,
 ) -> str:
     """
     Retrieve messages with optional filters.
@@ -724,6 +860,7 @@ async def list_messages(
         search_query: Filter messages containing this text.
         from_date: Filter messages starting from this date (format: YYYY-MM-DD).
         to_date: Filter messages until this date (format: YYYY-MM-DD).
+        include_media: Include media summary in output.
     """
     try:
         entity = await client.get_entity(chat_id)
@@ -822,8 +959,25 @@ async def list_messages(
 
             engagement_info = get_engagement_info(msg)
 
+            media_info = ""
+            if include_media and msg.media:
+                if is_image_message(msg):
+                    meta = get_image_meta(msg)
+                    dims = (
+                        f"{meta.get('width')}x{meta.get('height')}"
+                        if meta.get("width") and meta.get("height")
+                        else "unknown"
+                    )
+                    size = meta.get("size") or "unknown"
+                    mime = meta.get("mime_type") or "unknown"
+                    media_info = f" | Media: image {mime} {dims} size={size}"
+                elif is_sticker_message(msg):
+                    media_info = " | Media: sticker (excluded)"
+                else:
+                    media_info = f" | Media: {type(msg.media).__name__}"
+
             lines.append(
-                f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info}{engagement_info} | Message: {message_text}"
+                f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info}{engagement_info}{media_info} | Message: {message_text}"
             )
 
         return "\n".join(lines)
@@ -2718,6 +2872,64 @@ async def get_media_info(chat_id: Union[int, str], message_id: int) -> str:
 
 
 @mcp.tool(
+    annotations=ToolAnnotations(title="Get Message Image", openWorldHint=True, readOnlyHint=True)
+)
+@validate_id("chat_id")
+async def get_message_image(
+    chat_id: Union[int, str],
+    message_id: int,
+    prefer_thumbnail: bool = False,
+    max_bytes: int = 10_485_760,
+) -> str:
+    """
+    Get image data (base64) from a message containing a photo or image document.
+    Stickers are excluded.
+
+    Args:
+        chat_id: The chat ID or username.
+        message_id: The message ID containing the image.
+        prefer_thumbnail: Return a thumbnail when available.
+        max_bytes: Maximum allowed image size in bytes.
+    """
+    try:
+        entity = await client.get_entity(chat_id)
+        msg = await client.get_messages(entity, ids=message_id)
+
+        if not msg or not msg.media:
+            return "No media found in the specified message."
+        if is_sticker_message(msg):
+            return "Message contains a sticker. Stickers are excluded."
+        if not is_image_message(msg):
+            return "Media is not an image."
+
+        buffer = io.BytesIO()
+        thumb = 1 if prefer_thumbnail else None
+        await client.download_media(msg, file=buffer, thumb=thumb)
+        data = buffer.getvalue()
+        if not data:
+            return "Failed to download image data."
+        if len(data) > max_bytes:
+            return (
+                f"Image exceeds max_bytes ({len(data)} > {max_bytes}). "
+                "Consider prefer_thumbnail=true or raise max_bytes."
+            )
+
+        meta = get_image_meta(msg)
+        meta["bytes"] = len(data)
+        meta["base64"] = base64.b64encode(data).decode("ascii")
+        return json.dumps(meta, indent=2)
+    except Exception as e:
+        return log_and_format_error(
+            "get_message_image",
+            e,
+            chat_id=chat_id,
+            message_id=message_id,
+            prefer_thumbnail=prefer_thumbnail,
+            max_bytes=max_bytes,
+        )
+
+
+@mcp.tool(
     annotations=ToolAnnotations(title="Search Public Chats", openWorldHint=True, readOnlyHint=True)
 )
 async def search_public_chats(query: str) -> str:
@@ -4132,7 +4344,14 @@ async def _main() -> None:
 
         print("Telegram client started. Running MCP server...")
         # Use the asynchronous entrypoint instead of mcp.run()
-        await mcp.run_stdio_async()
+        if MCP_TRANSPORT == "stdio":
+            await mcp.run_stdio_async()
+        elif MCP_TRANSPORT == "streamable_http":
+            await mcp.run_streamable_http_async()
+        elif MCP_TRANSPORT == "sse":
+            await mcp.run_sse_async()
+        else:
+            raise ValueError(f"Unsupported MCP_TRANSPORT: {MCP_TRANSPORT}")
     except Exception as e:
         print(f"Error starting client: {e}", file=sys.stderr)
         if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
